@@ -1,0 +1,911 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+ 
+#Prepare data
+## Library
+
+```{r, message=FALSE, warning=FALSE}
+library(tidymodels)
+library(tidyverse)
+library(janitor)
+library(vip)
+library(skimr)
+library(NeuralNetTools)
+library(xgboost)
+library(solitude) # -- new package 
+```
+
+## Import Data
+
+```{r}
+
+loan <- read.csv("loan_train.csv") %>% clean_names() 
+
+skim(loan)
+loan_kaggle <- read_csv("loan_holdout.csv")%>% clean_names()
+
+```
+
+## Data cleaning & transformation
+
+```{r}
+#delete variables
+loan_del = loan %>% 
+  dplyr::select(!c(id,member_id, emp_title, title, url, desc,
+                   zip_code,mths_since_last_delinq,emp_length,
+                   mths_since_last_record,next_pymnt_d, last_credit_pull_d,
+                   collections_12_mths_ex_med,policy_code,last_pymnt_d,earliest_cr_line,issue_d,
+                   tax_liens,pub_rec_bankruptcies,delinq_amnt,chargeoff_within_12_mths,	acc_now_delinq,pub_rec,delinq_2yrs,
+                   application_type))
+
+
+
+#transform some variables
+loan_model = loan_del %>% 
+  mutate(term = as.numeric(str_replace(term, " months", "")),
+         int_rate = as.numeric(str_replace(int_rate, "%", "")),
+         revol_util = as.numeric(str_replace(revol_util, "%", "")))
+
+skim(loan_model)
+
+#kaggle
+loan_kaggle_del = loan_kaggle %>% 
+  dplyr::select(!c(member_id, emp_title, title, url, desc,
+                   zip_code,mths_since_last_delinq,emp_length,
+                   mths_since_last_record,next_pymnt_d, last_credit_pull_d,
+                   collections_12_mths_ex_med,policy_code,last_pymnt_d,earliest_cr_line,issue_d,
+                   tax_liens,pub_rec_bankruptcies,delinq_amnt,chargeoff_within_12_mths,	acc_now_delinq,pub_rec,delinq_2yrs,
+                   application_type))
+
+loan_kaggle_model = loan_kaggle_del %>% 
+  mutate(term = as.numeric(str_replace(term, " months", "")),
+         int_rate = as.numeric(str_replace(int_rate, "%", "")),
+         revol_util = as.numeric(str_replace(revol_util, "%", "")))
+skim(loan_kaggle_model)
+```
+#Exploraing
+
+# Recipe 
+```{r}
+# deal w. categoricals 
+ir_recipe <- recipe(~.,loan_model) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  prep()
+
+
+bake_loan <- bake(ir_recipe, loan_model)
+skim(bake_loan)
+
+
+```
+
+
+# Isolation Forest
+## Isolation train
+```{r}
+iso_forest <- isolationForest$new(
+  sample_size = 256,
+  num_trees = 100,
+  max_depth = ceiling(log2(256)))
+
+
+iso_forest$fit(bake_loan)
+```
+
+
+```{r}
+pred_train<- iso_forest$predict(bake_loan)
+
+pred_train%>%
+  ggplot(aes(average_depth)) +
+  geom_histogram(bins=30) + 
+  geom_vline(xintercept = 7.1, linetype="dotted", 
+                color = "blue", size=1.5) + 
+  labs(title="Isolation Forest Average Tree Depth")
+
+
+pred_train %>%
+  ggplot(aes(anomaly_score)) +
+  geom_histogram(bins=30) + 
+  geom_vline(xintercept = 0.62, linetype="dotted", 
+                color = "blue", size=1.5) + 
+  labs(title="Isolation Forest Anomaly Score Above 0.62")
+
+
+
+
+```
+## global level interpretation 
+
+
+```{r}
+train_pred <- bind_cols(iso_forest$predict(bake_loan),bake_loan) %>%
+  mutate(anomaly = as.factor(if_else(average_depth <= 7.1, "Anomaly","Normal")))
+
+train_pred %>%
+  arrange(average_depth) %>%
+  count(anomaly)
+
+```
+
+## Fit a Tree 
+```{r}
+fmla <- as.formula(paste("anomaly ~ ", paste(bake_loan %>% colnames(), collapse= "+")))
+
+outlier_tree <- decision_tree(min_n=2, tree_depth=3, cost_complexity = .01) %>%
+  set_mode("classification") %>%
+  set_engine("rpart") %>%
+  fit(fmla, data=train_pred)
+
+outlier_tree$fit
+```
+
+```{r}
+library(rpart.plot) # -- plotting decision trees 
+
+rpart.plot(outlier_tree$fit,clip.right.labs = FALSE, branch = .3, under = TRUE, roundint=FALSE, extra=3)
+
+```
+## Global Anomaly Rules 
+
+```{r}
+anomaly_rules <- rpart.rules(outlier_tree$fit,roundint=FALSE, extra = 4, cover = TRUE, clip.facs = TRUE) %>% clean_names() %>%
+  #filter(anomaly=="Anomaly") %>%
+  mutate(rule = "IF") 
+
+
+rule_cols <- anomaly_rules %>% select(starts_with("x_")) %>% colnames()
+
+for (col in rule_cols){
+anomaly_rules <- anomaly_rules %>%
+    mutate(rule = paste(rule, !!as.name(col)))
+}
+
+anomaly_rules %>%
+  as.data.frame() %>%
+  filter(anomaly == "Anomaly") %>%
+  mutate(rule = paste(rule, " THEN ", anomaly )) %>%
+  mutate(rule = paste(rule," coverage ", cover)) %>%
+  select( rule)
+
+anomaly_rules %>%
+  as.data.frame() %>%
+  filter(anomaly == "Normal") %>%
+  mutate(rule = paste(rule, " THEN ", anomaly )) %>%
+  mutate(rule = paste(rule," coverage ", cover)) %>%
+  select( rule)
+```
+
+```{r}
+
+pred_train <- bind_cols(iso_forest$predict(bake_loan),
+                        bake_loan)
+
+
+pred_train %>%
+  arrange(desc(anomaly_score) ) %>%
+  filter(average_depth <= 7.1)  %>%
+  slice_max(order_by=anomaly_score,n=5)
+
+
+```
+
+## Local Anomaly Rules 
+```{r}
+
+fmla <- as.formula(paste("anomaly ~ ", paste(bake_loan %>% colnames(), collapse= "+")))
+
+pred_train %>%
+  mutate(anomaly= as.factor(if_else(id==172, "Anomaly", "Normal"))) -> local_df
+
+local_tree <-  decision_tree(mode="classification",
+                            tree_depth = 5,
+                            min_n = 1,
+                            cost_complexity=0) %>%
+              set_engine("rpart") %>%
+                  fit(fmla,local_df )
+
+local_tree$fit
+
+rpart.rules(local_tree$fit, extra = 4, cover = TRUE, clip.facs = TRUE, roundint=FALSE)
+rpart.plot(local_tree$fit, roundint=FALSE, extra=3)
+
+anomaly_rules <- rpart.rules(local_tree$fit, extra = 4, cover = TRUE, clip.facs = TRUE) %>% clean_names() %>%
+  filter(anomaly=="Anomaly") %>%
+  mutate(rule = "IF") 
+
+
+rule_cols <- anomaly_rules %>% select(starts_with("x_")) %>% colnames()
+
+for (col in rule_cols){
+anomaly_rules <- anomaly_rules %>%
+    mutate(rule = paste(rule, !!as.name(col)))
+}
+
+as.data.frame(anomaly_rules) %>%
+  select(rule, cover)
+
+```
+
+```{r}
+local_explainer <- function(ID){
+  
+  fmla <- as.formula(paste("anomaly ~ ", paste(bake_loan %>% colnames(), collapse= "+")))
+  
+  pred_train %>%
+    mutate(anomaly= as.factor(if_else(id==ID, "Anomaly", "Normal"))) -> local_df
+  
+  local_tree <-  decision_tree(mode="classification",
+                              tree_depth = 3,
+                              min_n = 1,
+                              cost_complexity=0) %>%
+                set_engine("rpart") %>%
+                    fit(fmla,local_df )
+  
+  local_tree$fit
+  
+  #rpart.rules(local_tree$fit, extra = 4, cover = TRUE, clip.facs = TRUE)
+  rpart.plot(local_tree$fit, roundint=FALSE, extra=3) %>% print()
+  
+  anomaly_rules <- rpart.rules(local_tree$fit, extra = 4, cover = TRUE, clip.facs = TRUE) %>% clean_names() %>%
+    filter(anomaly=="Anomaly") %>%
+    mutate(rule = "IF") 
+  
+  
+  rule_cols <- anomaly_rules %>% select(starts_with("x_")) %>% colnames()
+  
+  for (col in rule_cols){
+  anomaly_rules <- anomaly_rules %>%
+      mutate(rule = paste(rule, !!as.name(col)))
+  }
+  
+  as.data.frame(anomaly_rules) %>%
+    select(rule, cover) %>%
+    print()
+}
+
+pred_train %>%
+  filter(average_depth < 7.1) %>%
+  slice_max(order_by=anomaly_score,n=5) %>%
+  pull(id) -> anomaly_vect
+
+for (anomaly_id in anomaly_vect){
+  #print(anomaly_id)
+  local_explainer(anomaly_id)
+}
+```
+
+
+# Exploring
+## Target varaible
+
+```{r}
+
+loan_model %>% 
+  count(loan_status) %>% 
+  mutate(pct = n/sum(n)) %>% 
+  ggplot(aes(x = loan_status, y = n, fill = loan_status)) + 
+  geom_bar(stat = "identity", show.legend = F) +
+  geom_text(aes(label = paste0(round(pct*100,1), "%")) , vjust = 2.5, colour = "white")  +
+  labs(x = "Loan Status",
+       y = "Count") +
+  theme_classic()
+
+```
+
+## Numeric variables
+
+```{r}
+
+boxplot <- function(m){
+    ggplot(loan_model, 
+           aes(x=!!as.name(m),
+               y=as.factor(loan_status))) + 
+    geom_boxplot(show.legend = F)  + 
+    labs(title = as.character(m), y = 'Loan Status') +
+    theme(legend.title = element_blank()) 
+}
+
+
+for (column in names(loan_model %>% select_if (is.numeric))){
+    print(boxplot(column))
+}
+
+```
+
+## Explore character
+
+```{r, warning=FALSE, message=FALSE}
+
+char_explore <- function(col){
+  loan_model %>%
+    ggplot(., aes(!!as.name(col))) + 
+    geom_bar(aes(fill = factor(loan_status)), position = "fill") +theme_bw() + theme(panel.grid=element_blank()) + scale_fill_brewer(palette = 5) +
+  coord_flip()
+}
+
+#character var
+for (column in names(loan_model %>% select_if(is_character))){
+    chrt <- char_explore(column)
+    print(chrt)
+}
+
+```
+## Correlations
+
+```{r}
+library(reshape2)
+library(corrplot)
+library(PerformanceAnalytics)
+cor_analysis <- loan_model %>%
+  na.omit() %>%
+  dplyr::select(loan_amnt, funded_amnt, funded_amnt_inv, int_rate, installment, annual_inc, dti, fico_range_low, fico_range_high, open_acc, revol_bal, revol_util, total_acc, last_pymnt_amnt) %>%
+  cor() %>%
+  melt() %>%
+  arrange(desc(value)) 
+ 
+cor_analysis_1 <- loan_model %>%
+  na.omit() %>%
+  dplyr::select(loan_amnt, funded_amnt, funded_amnt_inv, int_rate, installment, annual_inc, dti, fico_range_low, fico_range_high, open_acc, revol_bal, revol_util, total_acc, last_pymnt_amnt)
+
+cormat <- cor(cor_analysis_1)
+round(cormat, 2) 
+corrplot(cormat)  
+
+pairs(cor_analysis_1)
+
+chart.Correlation(cor_analysis_1, histogram=TRUE, pch=4)  
+
+cor_analysis %>%
+  ggplot(aes(Var2, Var1, fill = value)) +
+  geom_tile(color = "black")+ geom_text(aes(label = round(value,2)), color = "white", size = 3) +
+  coord_fixed() +
+  theme(axis.text.x=element_text(angle=45, hjust=1))
+```
+
+
+# Data preparation
+## Preparing data
+
+```{r}
+loan_model <- loan_model %>%
+  mutate_if(is.character,as.factor) %>%
+  mutate(loan_status = factor(loan_status)) 
+
+head(loan_model)
+```
+
+## Train Test Split 
+
+```{r}
+set.seed(42)
+
+train_test_spit<- initial_split(loan_model, prop = 0.7, strata=loan_status)
+
+train <- training(train_test_spit)
+test  <- testing(train_test_spit)
+
+
+sprintf("Train PCT : %1.2f%%", nrow(train)/ nrow(loan_model) * 100)
+sprintf("Test  PCT : %1.2f%%", nrow(test)/ nrow(loan_model) * 100)
+
+kfold_splits <- vfold_cv(train, v=5)
+```
+## Recipe 
+
+```{r}
+# define LR recipe
+lr_recipe <- recipe(loan_status ~ .,data = train) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_nzv(all_nominal_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+# -- define recipe 
+loan_recipe <- recipe(loan_status ~ loan_amnt + funded_amnt + funded_amnt_inv + term + int_rate + installment + annual_inc + fico_range_low + inq_last_6mths + open_acc + revol_bal + revol_util + total_acc + total_rec_late_fee + last_pymnt_amnt + grade ,data = train) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_nzv(all_nominal_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+## -- define recipe for an MLP 
+loan_recipe_nn <- recipe(loan_status ~ loan_amnt + funded_amnt + funded_amnt_inv + term + int_rate + installment + annual_inc + fico_range_low + inq_last_6mths + open_acc + revol_bal + revol_util + total_acc + total_rec_late_fee + last_pymnt_amnt + grade , data = train) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  themis::step_downsample(loan_status,under_ratio = 1) %>%
+  step_nzv(all_nominal_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())  %>%
+  step_dummy(all_nominal_predictors())
+
+bake(loan_recipe_nn %>% prep(), train %>% sample_n(1000))
+```
+
+
+# Models & Workflows 
+
+```{r}
+
+# -- XGB model & workflow 
+xgb_model <- boost_tree(
+  trees=40, learn_rate = 0.1,tree_depth = 20) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_workflow_fit <- workflow() %>%
+  add_recipe(loan_recipe) %>%
+  add_model(xgb_model) %>% 
+  fit(train)
+
+xgb_workflow_fit2 <- workflow() %>%
+  add_recipe(loan_recipe) %>%
+  add_model(xgb_model) %>% 
+  fit_resamples(kfold_splits)
+
+collect_metrics(xgb_workflow_fit2)
+
+# -- RF model & workflow 
+rf_model <- rand_forest(
+  trees = 100, min_n = 20) %>% 
+  set_engine("ranger",num.threads = 8, importance = "permutation") %>% 
+  set_mode("classification" )
+
+rf_workflow_fit <- workflow() %>%
+  add_recipe(loan_recipe) %>%
+  add_model(rf_model)%>% 
+  fit(train)
+
+rf_workflow_fit2 <- workflow() %>%
+  add_recipe(loan_recipe) %>%
+  add_model(rf_model)%>% 
+  fit_resamples(kfold_splits)
+
+collect_metrics(rf_workflow_fit2)
+
+# -- NNet model & workflow 
+logistic_spec <- logistic_reg() %>%
+  set_mode("classification") %>%
+  set_engine("glm")
+
+logistic_wf <- workflow() %>%
+  add_recipe(loan_recipe) %>%
+  add_model(logistic_spec) %>%
+  fit(train)
+
+logistic_wf2 <- workflow() %>%
+  add_recipe(loan_recipe) %>%
+  add_model(logistic_spec) %>%
+  fit_resamples(kfold_splits)
+
+collect_metrics(nn_workflow_fit2)
+
+
+
+```
+
+## Standard Evaluation 
+
+```{r}
+
+evaluate_models <- function(model_workflow, model_name){
+    # 1. Make Predictions
+score_train <- bind_cols(
+  predict(model_workflow,train, type="prob"), 
+  predict(model_workflow,train, type="class"),
+  train) %>% 
+  mutate(part = "train") 
+
+score_test <- bind_cols(
+  predict(model_workflow,test, type="prob"), 
+   predict(model_workflow,test, type="class"),
+  test) %>% 
+  mutate(part = "test") 
+
+
+
+bind_rows(score_train, score_test) %>%
+  group_by(part) %>%
+  metrics(loan_status, .pred_default, estimate=.pred_class) %>%
+  pivot_wider(id_cols = part, names_from = .metric, values_from = .estimate) %>%
+  mutate(model_name = model_name) %>% print()
+
+# precsion & recall
+score_train %>%
+  precision(loan_status, .pred_class) %>%
+  mutate(part="training") %>%
+  bind_rows(
+  score_test %>%
+  precision(loan_status, .pred_class) %>%
+    mutate(part="testing") 
+  )
+
+score_train %>%
+  recall(loan_status, .pred_class) %>%
+  mutate(part="training") %>%
+  bind_rows(
+  score_test %>%
+  recall(loan_status, .pred_class) %>%
+    mutate(part="testing") 
+  )
+
+# confusion matirx
+score_train %>%
+   mutate(predict_class = as.factor(if_else(.pred_default >=0.05,'default','current'))) %>%
+   conf_mat(loan_status, estimate = predict_class) %>%
+   autoplot(type = "heatmap") +
+   labs(title="confusion matrix threshold >= 0.5")
+
+score_test %>%
+   mutate(predict_class = as.factor(if_else(.pred_default >=0.05,'default','current'))) %>%
+   conf_mat(loan_status, estimate = predict_class) %>%
+   autoplot(type = "heatmap") +
+   labs(title="confusion matrix threshold >= 0.5")
+
+# operating range 0 - 10% 
+operating_range <- score_test %>%
+  roc_curve(loan_status, .pred_default)  %>%
+  mutate(
+    fpr = round((1 - specificity), 2),
+    tpr = round(sensitivity, 2),
+    score_threshold =  round(.threshold, 5)
+  ) %>%
+  group_by(fpr) %>%
+  summarise(threshold = round(mean(score_threshold),2),
+            tpr = mean(tpr)) %>%
+  filter(tpr >= 0.8)
+
+  print(operating_range)
+  
+# ROC Curve 
+bind_rows(score_train, score_test) %>%
+  group_by(part) %>%
+  roc_curve(truth=loan_status, predicted=.pred_default) %>% 
+  autoplot() +
+   geom_vline(xintercept = 0.34,    
+             color = "black",
+             linetype = "longdash") +
+   labs(title = model_name, x = "FPR(1 - specificity)", y = "TPR(recall)") -> roc_chart 
+
+  print(roc_chart)
+  
+# Score Distribution 
+score_test %>%
+  ggplot(aes(.pred_default,fill=loan_status)) +
+  geom_histogram(bins=50) +
+  geom_vline(aes(xintercept=.05, color="red")) +
+  geom_vline(aes(xintercept=.1, color="green")) +
+  geom_vline(aes(xintercept=.2, color="blue")) +
+  labs(title = model_name) -> score_dist 
+
+print(score_dist)
+
+  # Variable Importance 
+  model_workflow %>%
+    extract_fit_parsnip() %>%
+    vip(10) + 
+    labs(model_name)  -> vip_model 
+  
+    print(vip_model)
+    
+  
+}
+
+
+```
+## Evalusting XGB
+```{r}
+evaluate_models(xgb_workflow_fit, "XGB model")
+```
+## Evalusting RF
+```{r}
+evaluate_models(rf_workflow_fit, "RF model")
+```
+## Evalusting LR
+```{r}
+evaluate_models(logistic_wf, "model")
+```
+
+
+
+# Global Explainations  
+
+
+```{r}
+xgb_workflow_fit %>%
+    extract_fit_parsnip() %>%
+    vip(10)
+
+#last_pymnt_amnt
+#installment
+#int_rate
+#total_rec_late_fee
+#annual_inc
+```
+
+## BREAKDOWN Explainer 
+
+```{r}
+library(DALEXtra)
+
+# your model variables of interest 
+model_variables = c(".pred_default","loan_status",  'loan_amnt' , 'funded_amnt' , 'funded_amnt_inv' ,'term' , 'int_rate' ,'installment','annual_inc','fico_range_low','inq_last_6mths','open_acc','revol_bal','revol_util','total_acc','total_rec_late_fee','last_pymnt_amnt','grade')
+
+# step 1. create explainer 
+xgb_explainer <- 
+  explain_tidymodels(
+    xgb_workflow_fit,   # fitted workflow object 
+    data = train,    # original training data
+    y = train$loan_status, # predicted outcome 
+    label = "xgboost",
+    verbose = FALSE
+  )
+
+# step 2. get the record you want to predict 
+single_record <- score_test %>% select(all_of(model_variables)) %>%
+  mutate(intercept = "", prediction = .pred_default) %>%
+  slice_max(order_by = .pred_default, n=10) %>% head(1) 
+
+
+# step 3. run the explainer 
+xgb_breakdown <- predict_parts(explainer = xgb_explainer, 
+                               new_observation = single_record 
+                               )
+
+# step 4. plot it. 
+# you notice you don't get categorical values ...  
+xgb_breakdown %>% plot()
+
+# --- more involved explanations with categories. ---- 
+
+# step 4a.. convert breakdown to a tibble so we can join it
+xgb_breakdown %>%
+  as_tibble() -> breakdown_data 
+
+# step 4b. transpose your single record prediction 
+single_record %>% 
+ gather(key="variable_name",value="value") -> prediction_data 
+
+# step 4c. get a predicted probability for plot 
+prediction_prob <- single_record[,".pred_default"] %>% pull()
+
+# step 5. plot it.
+breakdown_data %>% 
+  inner_join(prediction_data) %>%
+  mutate(contribution = round(contribution,3),) %>%
+  filter(variable_name != "intercept") %>%
+  mutate(variable = paste(variable_name,value,sep = ": ")) %>% 
+  ggplot(aes(y=reorder(variable, contribution), x= contribution, fill=sign)) +
+  geom_col() + 
+  geom_text(aes(label=contribution), 
+          size=4,
+            position=position_dodge(width=0.7),
+            vjust=0.5,
+            )+
+  labs(
+    title = "DALEX explainations",
+    subtitle = paste("predicted:",as.character(round(prediction_prob,3))),
+                    x="contribution",
+                    y="features")
+
+```
+## SHAPLEY Explainer 
+
+```{r}
+
+# step 3. run the explainer 
+xgb_shapley <- predict_parts(explainer = xgb_explainer, 
+                               new_observation = single_record,
+                               type="shap")
+
+# step 4. plot it. 
+# you notice you don't get categorical values ...  
+xgb_shapley %>% plot()
+
+# --- more involved explanations with categories. ---- 
+
+# step 4a.. convert breakdown to a tibble so we can join it
+xgb_shapley %>%
+  as_tibble() -> shap_data 
+
+# step 4b. transpose your single record prediction 
+single_record %>% 
+ gather(key="variable_name",value="value") -> prediction_data 
+
+# step 4c. get a predicted probability for plot 
+prediction_prob <- single_record[,".pred_default"] %>% mutate(.pred_default = round(.pred_default,3)) %>% pull() 
+
+# step 5. plot it.
+shap_data %>% 
+  inner_join(prediction_data) %>%
+  mutate(variable = paste(variable_name,value,sep = ": ")) %>% 
+  group_by(variable) %>%
+  summarize(contribution = mean(contribution)) %>%
+  mutate(contribution = round(contribution,3),
+         sign = if_else(contribution < 0, "neg","pos")) %>%
+  ggplot(aes(y=reorder(variable, contribution), x= contribution, fill=sign)) +
+  geom_col() + 
+  geom_text(aes(label=contribution))+
+  labs(
+    title = "SHAPLEY explainations",
+    subtitle = paste("predicted probablity = ",prediction_prob) ,
+                    x="contribution",
+                    y="features")
+
+```
+## Make a Function 
+```{r}
+cars_explainer <- explain_tidymodels(
+    nn_workflow_fit,   # fitted workflow object 
+    data = train,    # original training data
+    y = train$loan_status, # predicted outcome 
+    label = "xgboost",
+    verbose = FALSE
+  )
+
+explain_prediction <- function(single_record){
+  # step 3. run the explainer 
+record_shap <- predict_parts(explainer = xgb_explainer, 
+                               new_observation = single_record,
+                               type="shap")
+
+# step 4. plot it. 
+# you notice you don't get categorical values ...  
+record_shap %>% plot() %>% print()
+
+# --- more involved explanations with categories. ---- 
+
+# step 4a.. convert breakdown to a tibble so we can join it
+record_shap %>%
+  as_tibble() -> shap_data 
+
+# step 4b. transpose your single record prediction 
+single_record %>% 
+ gather(key="variable_name",value="value") -> prediction_data 
+
+# step 4c. get a predicted probability for plot 
+prediction_prob <- single_record[,".pred_default"] %>% mutate(.pred_default = round(.pred_default,3)) %>% pull() 
+
+# step 5. plot it.
+shap_data %>% 
+  inner_join(prediction_data) %>%
+  mutate(variable = paste(variable_name,value,sep = ": ")) %>% 
+  group_by(variable) %>%
+  summarize(contribution = mean(contribution)) %>%
+  mutate(contribution = round(contribution,3),
+         sign = if_else(contribution < 0, "neg","pos")) %>%
+  ggplot(aes(y=reorder(variable, contribution), x= contribution, fill=sign)) +
+  geom_col() + 
+  geom_text(aes(label=contribution))+
+  labs(
+    title = "SHAPLEY explainations",
+    subtitle = paste("predicted probablity = ",prediction_prob) ,
+                    x="contribution",
+                    y="features")
+  
+}
+
+any_5_records <- score_test %>%
+ sample_n(5)
+
+top_5_tp <- score_test %>%
+  filter(.pred_class == loan_status) %>%
+  slice_max(.pred_default,n=5)
+
+top_5_fp <- score_test %>%
+  filter(.pred_class != loan_status) %>%
+   filter(loan_status == 0 ) %>%
+  slice_max(.pred_default,n=5)
+
+top_5_fn <- score_test %>%
+  filter(.pred_class != loan_status ) %>%
+  filter(loan_status == 1 ) %>%
+  slice_max(.pred_default,n=5)
+
+
+# example any 5 records
+for (row in 1:nrow(any_5_records)) {
+    s_record <- any_5_records[row,]
+    explain_prediction(s_record)
+} 
+
+# repeat for FP and FN 
+for (row in 1:nrow(top_5_tp)) {
+    s_record <- top_5_tp[row,]
+    explain_prediction(s_record)
+} 
+```
+
+
+
+
+# Partial Dependance Plot (XGBoost)
+
+```{r}
+# create an explainer of a model
+
+xgb_explainer <- explain_tidymodels(
+  xgb_workflow_fit,
+  data = train ,
+  y = train$loan_default ,
+  verbose = TRUE
+)
+#last_pymnt_amnt
+#installment
+#int_rate
+#total_rec_late_fee
+
+
+xgb_variable <- c('last_pymnt_amnt', 'installment', 'int_rate', 'total_rec_late_fee','annual_inc')
+
+pdp <- function(m){
+
+# create a profile of a single variable for a model
+
+pdp_variable <- model_profile(
+  xgb_explainer,
+  variables = as.character(m)
+)
+
+# Plot it
+
+plot(pdp_variable) +
+  ggtitle(paste0("Partial Dependence Plot for ", as.character(m))) +
+  theme(axis.text.x=element_text(angle=45, hjust=1))
+
+}
+
+for (c in xgb_variable){
+    print(pdp(c))
+}
+```
+
+
+
+
+
+
+
+
+
+```{r}
+
+score_test <- bind_cols(
+  predict(xgb_workflow_fit,test, type="prob"), 
+   predict(xgb_workflow_fit,test, type="class"),
+  test) %>% 
+  mutate(part = "test") 
+
+# lowest scores 
+score_test %>%
+  slice_min(order_by = .pred_default, n=10)
+
+# highest scores 
+score_test %>%
+  slice_max(order_by = .pred_default, n=10)
+
+# highest scores 
+score_test %>%
+  filter(loan_status == 'current') %>%
+  slice_max(order_by = .pred_default, n=10)
+```
+
+
+# Prediction
+
+```{r, eval=TRUE, warning=FALSE, message=FALSE}
+
+kaggle_prediction <- predict(xgb_workflow_fit, loan_kaggle_model, type = "prob") %>%
+  bind_cols(predict(xgb_workflow_fit, loan_kaggle_model, type = "class")) %>%
+  bind_cols(loan_kaggle_model) %>%
+  dplyr:::select.data.frame(id, loan_status = .pred_default)
+
+head(kaggle_prediction) 
+  
+kaggle_prediction %>% write_csv("final_project_pred.csv")
+
+```

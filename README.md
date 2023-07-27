@@ -1,4 +1,4 @@
-# mlcourse
+## Unraveling Loan Default Predictors: Advanced Modeling and Strategic Insights
 * Proficient in developing and evaluating predictive models using logistic regression, XGBoost, and random forest techniques to analyze and understand factors influencing loan defaults.
 
 * Skilled in data preparation, anomaly detection, and feature transformation to ensure accurate and reliable modeling results. Developed and compared multiple machine learning models, including logistic regression, neural network, and XGBoosting. Evaluated model performance using metrics such as AUC, LogLoss, Precision, Recall, and F1 score.
